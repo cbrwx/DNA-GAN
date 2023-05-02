@@ -33,6 +33,9 @@ SOD1,Superoxide_Dismutase,MNTEMTSLVKAGTLKKNQGAPTGILQYLGRDSEFVQWFTVNKQTFQYISNKLNS
 
 - Set the environmental factors you want to consider when generating the DNA sequences.
 
+```
+env = Environment(25.0, 7.0, 0.5, 0.0)
+```
 - Train the GAN using the train_gan() function.
 
 - Generate DNA sequences using the trained GAN.
