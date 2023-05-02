@@ -68,4 +68,4 @@ SOD1,Superoxide_Dismutase,MNTEMTSLVKAGTLKKNQGAPTGILQYLGRDSEFVQWFTVNKQTFQYISNKLNS
 
 - Evaluate performance using real-world metrics: Develop methods to evaluate the performance of the generated sequences using real-world metrics or experimental data, such as gene expression levels, protein stability, or metabolic pathway efficiency.
 
-.cbrwx
+- Dont be lazy, do it!.. cbrwx
