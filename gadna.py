@@ -10,13 +10,15 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
 
+env = Environment(25.0, 7.0, 0.5, 0.0)
+
 class Environment:
     def __init__(self, temperature, pH, chemical_exposure, radiation):
         self.temperature = temperature
         self.pH = pH
         self.chemical_exposure = chemical_exposure
         self.radiation = radiation
-
+        
 class DNATokenizer:
     def __init__(self, environment):
         self.token2idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, '<EOS>': 4}
@@ -260,3 +262,27 @@ def train_gan(generator, discriminator, dataloader, epochs, device, clip_grad=1.
     for i, seq in enumerate(generated_seqs):
         print(f"Sequence {i+1}: {seq}")
         print(f"Discriminator Score: {discriminator_scores[i]}\n")
+        
+if __name__ == "__main__":
+    # Load dataset
+    x_data, y_data, dna_purpose = load_dataset("train.csv", env)
+    x_data_val, y_data_val = load_validation_dataset("val.csv", env)
+
+    # Create DataLoaders
+    train_dataset = CustomDataset(x_data, y_data)
+    val_dataset = CustomDataset(x_data_val, y_data_val)
+    dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+    dataloader_val = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+
+    # Instantiate the generator and discriminator
+    input_dim = len(DNATokenizer(env).token2idx)
+    hidden_dim = 128
+    output_dim = input_dim
+    generator = Generator(input_dim, hidden_dim, output_dim, env)
+    discriminator = Discriminator(input_dim, hidden_dim, env)
+
+    # Train the GAN
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    generator.to(device)
+    discriminator.to(device)
+    train_gan(generator, discriminator, dataloader, 100, device)      
