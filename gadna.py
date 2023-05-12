@@ -10,7 +10,6 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
 
-env = Environment(25.0, 7.0, 0.5, 0.0)
 
 class Environment:
     def __init__(self, temperature, pH, chemical_exposure, radiation):
@@ -18,18 +17,22 @@ class Environment:
         self.pH = pH
         self.chemical_exposure = chemical_exposure
         self.radiation = radiation
-        
+
+
+env = Environment(25.0, 7.0, 0.5, 0.0)
+
+
 class DNATokenizer:
-    def __init__(self, environment):
+    def __init__(self):
         self.token2idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, '<EOS>': 4}
         self.idx2token = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: '<EOS>'}
-        self.environment = environment
 
     def encode(self, dna_sequence):
         return [self.token2idx[token] for token in dna_sequence] + [self.token2idx['<EOS>']]
 
     def decode(self, encoded_sequence):
         return [self.idx2token[idx] for idx in encoded_sequence[:-1]]
+
 
 def load_dataset(csv_file, environment):
     with open(csv_file, 'r') as f:
@@ -42,8 +45,9 @@ def load_dataset(csv_file, environment):
             line = line.strip()
             if len(line) > 0:
                 dataset.append(line)
-    x_data, y_data = tokenize_and_encode(dataset, environment)
+    x_data, y_data = tokenize_and_encode(dataset)
     return x_data, y_data, dna_purpose
+
 
 def load_validation_dataset(csv_file, environment):
     with open(csv_file, 'r') as f:
@@ -56,11 +60,12 @@ def load_validation_dataset(csv_file, environment):
             line = line.strip()
             if len(line) > 0:
                 dataset.append(line)
-    x_data, y_data = tokenize_and_encode(dataset, environment)
+    x_data, y_data = tokenize_and_encode(dataset)
     return x_data, y_data
 
-def tokenize_and_encode(dataset, environment):
-    tokenizer = DNATokenizer(environment)
+
+def tokenize_and_encode(dataset):
+    tokenizer = DNATokenizer()
     x_data = []
     y_data = []
 
@@ -70,6 +75,7 @@ def tokenize_and_encode(dataset, environment):
         y_data.append(tokens[1:])
 
     return x_data, y_data
+
 
 class CustomDataset(Dataset):
     def __init__(self, x_data, y_data):
@@ -86,12 +92,14 @@ class CustomDataset(Dataset):
         y_length = len(y)
         return x, y, x_length, y_length
 
+
 def collate_fn(batch):
     batch.sort(key=lambda x: x[2], reverse=True)
     x_data, y_data, x_lengths, y_lengths = zip(*batch)
     x_data_padded = pad_sequence(x_data, padding_value=0, batch_first=True)
     y_data_padded = pad_sequence(y_data, padding_value=0, batch_first=True)
     return x_data_padded, y_data_padded, torch.tensor(x_lengths), torch.tensor(y_lengths)
+
 
 class Generator(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, environment):
@@ -112,6 +120,7 @@ class Generator(nn.Module):
         x = self.softmax(self.fc3(x))
         return x
 
+
 class Discriminator(nn.Module):
     def __init__(self, input_dim, hidden_dim, environment):
         super(Discriminator, self).__init__()
@@ -131,7 +140,12 @@ class Discriminator(nn.Module):
 
     def score(self, x):
         # Evaluate the discriminator score for the generated sequences
-        return self.discriminator(x)
+        return self.forward(x)
+
+
+def save_model(model, filename):
+    torch.save(model.state_dict(), filename)
+
 
 def train_gan(generator, discriminator, dataloader, epochs, device, clip_grad=1.0, lr_scheduler=None, early_stopping=None):
     generator.train()
@@ -145,8 +159,9 @@ def train_gan(generator, discriminator, dataloader, epochs, device, clip_grad=1.
     train_losses_d = []
     train_scores_d = []
 
-    best_loss = float('inf')
-    stop_counter = 0
+    best_val_loss = float('inf')
+    best_generator_state_dict = None
+    best_discriminator_state_dict = None
 
     for epoch in range(epochs):
         epoch_loss_g = 0
@@ -231,6 +246,7 @@ def train_gan(generator, discriminator, dataloader, epochs, device, clip_grad=1.
     # Visualize the generated DNA sequences
     num_samples = 10
     generated_seqs = []
+    tokenizer = DNATokenizer()
     for i in range(num_samples):
         noise = torch.randn(1, input_dim).to(device)
         generated_seq = []
@@ -239,18 +255,18 @@ def train_gan(generator, discriminator, dataloader, epochs, device, clip_grad=1.
                 output = generator(noise)
                 _, topi = output.max(2)
                 token = topi.item()
-                if token == DNATokenizer().token2idx['<EOS>']:
+                if token == tokenizer.token2idx['<EOS>']:
                     break
                 generated_seq.append(token)
                 noise = output
-        dna_seq = DNATokenizer().decode(generated_seq)
+        dna_seq = tokenizer.decode(generated_seq)
         generated_seqs.append(''.join(dna_seq))
         print(f"Generated DNA sequence {i+1}: {generated_seqs[-1]}")
 
     # Compute discriminator score for each generated sequence
     discriminator_scores = []
     for seq in generated_seqs:
-        encoded_seq = torch.tensor([DNATokenizer().encode(seq)]).to(device)
+        encoded_seq = torch.tensor([tokenizer.encode(seq)]).to(device)
         score = discriminator.score(encoded_seq).item()
         discriminator_scores.append(score)
 
@@ -262,7 +278,7 @@ def train_gan(generator, discriminator, dataloader, epochs, device, clip_grad=1.
     for i, seq in enumerate(generated_seqs):
         print(f"Sequence {i+1}: {seq}")
         print(f"Discriminator Score: {discriminator_scores[i]}\n")
-        
+
 if __name__ == "__main__":
     # Load dataset
     x_data, y_data, dna_purpose = load_dataset("train.csv", env)
@@ -275,7 +291,7 @@ if __name__ == "__main__":
     dataloader_val = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
     # Instantiate the generator and discriminator
-    input_dim = len(DNATokenizer(env).token2idx)
+    input_dim = len(DNATokenizer().token2idx)
     hidden_dim = 128
     output_dim = input_dim
     generator = Generator(input_dim, hidden_dim, output_dim, env)
@@ -285,4 +301,4 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     generator.to(device)
     discriminator.to(device)
-    train_gan(generator, discriminator, dataloader, 100, device)      
+    train_gan(generator, discriminator, dataloader, 100, device)
