@@ -1,5 +1,10 @@
 import os
 import random
+import logging
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -9,296 +14,439 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
+# Set random seeds for reproducibility
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+
+@dataclass
 class Environment:
-    def __init__(self, temperature, pH, chemical_exposure, radiation):
-        self.temperature = temperature
-        self.pH = pH
-        self.chemical_exposure = chemical_exposure
-        self.radiation = radiation
+    temperature: float
+    pH: float
+    chemical_exposure: float
+    radiation: float
 
+    def validate(self) -> None:
+        if not 0 <= self.temperature <= 100:
+            raise ValueError("Temperature must be between 0 and 100")
+        if not 0 <= self.pH <= 14:
+            raise ValueError("pH must be between 0 and 14")
+        if not 0 <= self.chemical_exposure <= 1:
+            raise ValueError("Chemical exposure must be between 0 and 1")
+        if not 0 <= self.radiation <= 1:
+            raise ValueError("Radiation must be between 0 and 1")
 
-env = Environment(25.0, 7.0, 0.5, 0.0)
-
+@dataclass
+class TrainingConfig:
+    batch_size: int = 32
+    epochs: int = 100
+    learning_rate: float = 0.001
+    hidden_dim: int = 128
+    clip_grad: float = 1.0
+    patience: int = 10
+    min_delta: float = 0.001
 
 class DNATokenizer:
     def __init__(self):
-        self.token2idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, '<EOS>': 4}
-        self.idx2token = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: '<EOS>'}
+        self.token2idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, '<EOS>': 4, '<PAD>': 5}
+        self.idx2token = {v: k for k, v in self.token2idx.items()}
 
-    def encode(self, dna_sequence):
-        return [self.token2idx[token] for token in dna_sequence] + [self.token2idx['<EOS>']]
+    def encode(self, dna_sequence: str) -> List[int]:
+        try:
+            return [self.token2idx[token] for token in dna_sequence] + [self.token2idx['<EOS>']]
+        except KeyError as e:
+            raise ValueError(f"Invalid DNA sequence character: {e}")
 
-    def decode(self, encoded_sequence):
-        return [self.idx2token[idx] for idx in encoded_sequence[:-1]]
+    def decode(self, encoded_sequence: List[int]) -> str:
+        return ''.join(self.idx2token[idx] for idx in encoded_sequence if idx not in 
+                      {self.token2idx['<EOS>'], self.token2idx['<PAD>']})
 
-
-def load_dataset(csv_file, environment):
-    with open(csv_file, 'r') as f:
-        dna_purpose = f.readline().strip()
-    dataset = []
-    with open(csv_file, 'r') as f:
-        for line in f:
-            if line.startswith(">"):
-                continue
-            line = line.strip()
-            if len(line) > 0:
-                dataset.append(line)
-    x_data, y_data = tokenize_and_encode(dataset)
-    return x_data, y_data, dna_purpose
-
-
-def load_validation_dataset(csv_file, environment):
-    with open(csv_file, 'r') as f:
-        dna_purpose = f.readline().strip()
-    dataset = []
-    with open(csv_file, 'r') as f:
-        for line in f:
-            if line.startswith(">"):
-                continue
-            line = line.strip()
-            if len(line) > 0:
-                dataset.append(line)
-    x_data, y_data = tokenize_and_encode(dataset)
-    return x_data, y_data
-
-
-def tokenize_and_encode(dataset):
-    tokenizer = DNATokenizer()
-    x_data = []
-    y_data = []
-
-    for dna_seq in dataset:
-        tokens = tokenizer.encode(dna_seq)
-        x_data.append(tokens[:-1])
-        y_data.append(tokens[1:])
-
-    return x_data, y_data
-
-
-class CustomDataset(Dataset):
-    def __init__(self, x_data, y_data):
-        self.x_data = x_data
-        self.y_data = y_data
-
-    def __len__(self):
-        return len(self.x_data)
-
-    def __getitem__(self, index):
-        x = self.x_data[index]
-        y = self.y_data[index]
-        x_length = len(x)
-        y_length = len(y)
-        return x, y, x_length, y_length
-
-
-def collate_fn(batch):
-    batch.sort(key=lambda x: x[2], reverse=True)
-    x_data, y_data, x_lengths, y_lengths = zip(*batch)
-    x_data_padded = pad_sequence(x_data, padding_value=0, batch_first=True)
-    y_data_padded = pad_sequence(y_data, padding_value=0, batch_first=True)
-    return x_data_padded, y_data_padded, torch.tensor(x_lengths), torch.tensor(y_lengths)
-
+class AttentionLayer(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads=4)
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_output, _ = self.attention(x, x, x)
+        return self.norm(x + attn_output)
 
 class Generator(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, environment):
-        super(Generator, self).__init__()
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, environment: Environment):
+        super().__init__()
         self.environment = environment
-        self.env_dim = 4  # Number of environmental factors
-        self.fc1 = nn.Linear(self.env_dim, hidden_dim)
-        self.fc2 = nn.Linear(input_dim + hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, output_dim)
-        self.relu = nn.ReLU()
-        self.softmax = nn.Softmax(dim=2)
+        self.env_dim = 4
+        
+        self.embedding = nn.Embedding(input_dim, hidden_dim)
+        self.env_encoder = nn.Sequential(
+            nn.Linear(self.env_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True, dropout=0.1)
+        self.attention = AttentionLayer(hidden_dim)
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, output_dim)
+        )
 
-    def forward(self, x):
-        env_input = torch.tensor([self.environment.temperature, self.environment.pH, self.environment.chemical_exposure, self.environment.radiation], dtype=torch.float).unsqueeze(0).to(x.device)
-        env_out = self.relu(self.fc1(env_input))
-        x = torch.cat((x, env_out), dim=1)
-        x = self.relu(self.fc2(x))
-        x = self.softmax(self.fc3(x))
-        return x
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+        env_input = torch.tensor(
+            [self.environment.temperature, self.environment.pH,
+             self.environment.chemical_exposure, self.environment.radiation],
+            dtype=torch.float32
+        ).repeat(batch_size, 1).to(x.device)
+        
+        embedded = self.embedding(x)
+        env_encoded = self.env_encoder(env_input).unsqueeze(1).repeat(1, x.size(1), 1)
+        
+        combined = embedded + env_encoded
+        lstm_out, _ = self.lstm(combined)
+        attended = self.attention(lstm_out)
+        
+        return torch.softmax(self.output_layer(attended), dim=-1)
 
 class Discriminator(nn.Module):
-    def __init__(self, input_dim, hidden_dim, environment):
-        super(Discriminator, self).__init__()
+    def __init__(self, input_dim: int, hidden_dim: int, environment: Environment):
+        super().__init__()
         self.environment = environment
-        self.env_dim = 4  # Number of environmental factors
-        self.fc1 = nn.Linear(input_dim + self.env_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
+        self.env_dim = 4
+        
+        self.embedding = nn.Embedding(input_dim, hidden_dim)
+        self.env_encoder = nn.Sequential(
+            nn.Linear(self.env_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True, dropout=0.1)
+        self.attention = AttentionLayer(hidden_dim)
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
 
-    def forward(self, x):
-        env_input = torch.tensor([self.environment.temperature, self.environment.pH, self.environment.chemical_exposure, self.environment.radiation], dtype=torch.float).unsqueeze(0).repeat(x.size(0), 1).to(x.device)
-        x = torch.cat((x, env_input), dim=1)
-        x = self.relu(self.fc1(x))
-        x = self.sigmoid(self.fc2(x))
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._process(x)
 
-    def score(self, x):
-        # Evaluate the discriminator score for the generated sequences
-        return self.forward(x)
+    def score(self, x: torch.Tensor) -> torch.Tensor:
+        return self._process(x)
 
+    def _process(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+        env_input = torch.tensor(
+            [self.environment.temperature, self.environment.pH,
+             self.environment.chemical_exposure, self.environment.radiation],
+            dtype=torch.float32
+        ).repeat(batch_size, 1).to(x.device)
+        
+        embedded = self.embedding(x)
+        env_encoded = self.env_encoder(env_input).unsqueeze(1).repeat(1, x.size(1), 1)
+        
+        combined = embedded + env_encoded
+        lstm_out, _ = self.lstm(combined)
+        attended = self.attention(lstm_out)
+        
+        # Global average pooling
+        pooled = torch.mean(attended, dim=1)
+        return self.output_layer(pooled)
 
-def save_model(model, filename):
-    torch.save(model.state_dict(), filename)
+class EarlyStopping:
+    def __init__(self, patience: int = 7, min_delta: float = 0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
 
+    def __call__(self, val_loss: float) -> bool:
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+        return False
 
-def train_gan(generator, discriminator, dataloader, epochs, device, clip_grad=1.0, lr_scheduler=None, early_stopping=None):
+class ModelCheckpoint:
+    def __init__(self, filepath: str, save_best_only: bool = True):
+        self.filepath = filepath
+        self.save_best_only = save_best_only
+        self.best_loss = float('inf')
+
+    def save_checkpoint(self, model: nn.Module, val_loss: float) -> None:
+        if self.save_best_only:
+            if val_loss < self.best_loss:
+                self.best_loss = val_loss
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'val_loss': val_loss,
+                }, self.filepath)
+        else:
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'val_loss': val_loss,
+            }, self.filepath)
+
+def train_gan(
+    generator: nn.Module,
+    discriminator: nn.Module,
+    dataloader: DataLoader,
+    val_dataloader: DataLoader,
+    config: TrainingConfig,
+    device: torch.device
+) -> Tuple[List[float], List[float], List[float]]:
+    
     generator.train()
     discriminator.train()
 
     criterion = nn.BCELoss()
-    optimizer_g = optim.Adam(generator.parameters())
-    optimizer_d = optim.Adam(discriminator.parameters())
+    optimizer_g = optim.Adam(generator.parameters(), lr=config.learning_rate)
+    optimizer_d = optim.Adam(discriminator.parameters(), lr=config.learning_rate)
+    
+    scheduler_g = ReduceLROnPlateau(optimizer_g, mode='min', patience=5)
+    scheduler_d = ReduceLROnPlateau(optimizer_d, mode='min', patience=5)
+    
+    early_stopping = EarlyStopping(patience=config.patience, min_delta=config.min_delta)
+    g_checkpoint = ModelCheckpoint('generator_best.pth')
+    d_checkpoint = ModelCheckpoint('discriminator_best.pth')
 
     train_losses_g = []
     train_losses_d = []
     train_scores_d = []
 
-    best_val_loss = float('inf')
-    best_generator_state_dict = None
-    best_discriminator_state_dict = None
-
-    for epoch in range(epochs):
+    for epoch in range(config.epochs):
         epoch_loss_g = 0
         epoch_loss_d = 0
         epoch_score_d = 0
 
-        for i, data in enumerate(dataloader):
-            x_data, y_data, x_lengths, y_lengths = data
-            x_data = x_data.to(device)
-            y_data = y_data.to(device)
+        generator.train()
+        discriminator.train()
 
+        for batch in dataloader:
+            x_data, y_data, x_lengths, y_lengths = [b.to(device) for b in batch]
+
+            # Train discriminator
+            optimizer_d.zero_grad()
             real_labels = torch.ones(y_data.size(0), 1).to(device)
             fake_labels = torch.zeros(y_data.size(0), 1).to(device)
 
-            # Train the discriminator
-            optimizer_d.zero_grad()
             real_loss = criterion(discriminator(y_data), real_labels)
             fake_data = generator(x_data)
             fake_loss = criterion(discriminator(fake_data.detach()), fake_labels)
             d_loss = real_loss + fake_loss
+            
             d_loss.backward()
-            clip_grad_norm_(discriminator.parameters(), clip_grad)
+            clip_grad_norm_(discriminator.parameters(), config.clip_grad)
             optimizer_d.step()
 
-            # Train the generator
+            # Train generator
             optimizer_g.zero_grad()
             g_loss = criterion(discriminator(fake_data), real_labels)
             d_score = discriminator.score(fake_data).mean()
+            
             total_loss = g_loss + d_score
             total_loss.backward()
-            clip_grad_norm_(generator.parameters(), clip_grad)
+            clip_grad_norm_(generator.parameters(), config.clip_grad)
             optimizer_g.step()
 
             epoch_loss_g += g_loss.item()
             epoch_loss_d += d_loss.item()
             epoch_score_d += d_score.item()
 
-        avg_epoch_loss_g = epoch_loss_g / len(dataloader)
-        avg_epoch_loss_d = epoch_loss_d / len(dataloader)
-        avg_epoch_score_d = epoch_score_d / len(dataloader)
+        # Validation phase
+        generator.eval()
+        discriminator.eval()
+        val_loss_g = 0
+        val_loss_d = 0
 
-        train_losses_g.append(avg_epoch_loss_g)
-        train_losses_d.append(avg_epoch_loss_d)
-        train_scores_d.append(avg_epoch_score_d)
-
-        print(f"Epoch {epoch+1}/{epochs} | D loss: {avg_epoch_loss_d:.4f} | G loss: {avg_epoch_loss_g:.4f} | D score: {avg_epoch_score_d:.4f}")
-
-        # Evaluate the model on the validation set
-        if epoch % 10 == 0:
-            validation_losses = []
-            generator.eval()
-            discriminator.eval()
-            with torch.no_grad():
-                for data in dataloader_val:
-                    x_data, y_data, x_lengths, y_lengths = data
-                    x_data = x_data.to(device)
-                    y_data = y_data.to(device)
-
-                    fake_data = generator(x_data)
-                    loss = criterion(discriminator(fake_data), real_labels)
-                    validation_losses.append(loss.item())
-
-            avg_validation_loss = sum(validation_losses) / len(validation_losses)
-            print(f"Validation loss: {avg_validation_loss:.4f}")
-
-        # Update the best model based on validation loss
-        if avg_validation_loss < best_val_loss:
-            best_val_loss = avg_validation_loss
-            best_generator_state_dict = generator.state_dict()
-            best_discriminator_state_dict = discriminator.state_dict()
-
-        # Update the learning rate scheduler
-        if lr_scheduler is not None:
-            lr_scheduler.step(avg_epoch_loss_g)
-
-    # Restore the best model and save it
-    generator.load_state_dict(best_generator_state_dict)
-    discriminator.load_state_dict(best_discriminator_state_dict)
-    save_model(generator, "generator.pth")
-    save_model(discriminator, "discriminator.pth")
-
-    # Visualize the generated DNA sequences
-    num_samples = 10
-    generated_seqs = []
-    tokenizer = DNATokenizer()
-    for i in range(num_samples):
-        noise = torch.randn(1, input_dim).to(device)
-        generated_seq = []
         with torch.no_grad():
-            for j in range(100):
+            for batch in val_dataloader:
+                x_data, y_data, x_lengths, y_lengths = [b.to(device) for b in batch]
+                fake_data = generator(x_data)
+                val_loss_g += criterion(discriminator(fake_data), real_labels).item()
+                val_loss_d += criterion(discriminator(y_data), real_labels).item()
+
+        val_loss_g /= len(val_dataloader)
+        val_loss_d /= len(val_dataloader)
+
+        # Update schedulers
+        scheduler_g.step(val_loss_g)
+        scheduler_d.step(val_loss_d)
+
+        # Save checkpoints
+        g_checkpoint.save_checkpoint(generator, val_loss_g)
+        d_checkpoint.save_checkpoint(discriminator, val_loss_d)
+
+        # Early stopping
+        if early_stopping(val_loss_g):
+            logging.info("Early stopping triggered")
+            break
+
+        # Logging
+        logging.info(
+            f"Epoch {epoch+1}/{config.epochs} | "
+            f"D loss: {epoch_loss_d/len(dataloader):.4f} | "
+            f"G loss: {epoch_loss_g/len(dataloader):.4f} | "
+            f"D score: {epoch_score_d/len(dataloader):.4f} | "
+            f"Val G loss: {val_loss_g:.4f} | "
+            f"Val D loss: {val_loss_d:.4f}"
+        )
+
+        train_losses_g.append(epoch_loss_g / len(dataloader))
+        train_losses_d.append(epoch_loss_d / len(dataloader))
+        train_scores_d.append(epoch_score_d / len(dataloader))
+
+    return train_losses_g, train_losses_d, train_scores_d
+
+def visualize_training(losses_g: List[float], losses_d: List[float], scores_d: List[float]) -> None:
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.plot(losses_g)
+    plt.title('Generator Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(losses_d)
+    plt.title('Discriminator Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(scores_d)
+    plt.title('Discriminator Scores')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    
+    plt.tight_layout()
+    plt.savefig('training_visualization.png')
+    plt.close()
+
+def main():
+    set_seed(42)
+    
+    # Initialize environment
+    env = Environment(temperature=25.0, pH=7.0, chemical_exposure=0.5, radiation=0.0)
+    env.validate()
+    
+    # Configuration
+    config = TrainingConfig()
+    
+    # Device configuration
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
+
+    try:
+        # Load dataset
+        x_data, y_data, dna_purpose = load_dataset("train.csv", env)
+        x_data_val, y_data_val = load_validation_dataset("val.csv", env)
+
+        # Create DataLoaders
+        train_dataset = CustomDataset(x_data, y_data)
+        val_dataset = CustomDataset(x_data_val, y_data_val)
+        
+        dataloader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn
+        )
+        
+        dataloader_val = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn
+        )
+
+        # Initialize models
+        tokenizer = DNATokenizer()
+        input_dim = len(tokenizer.token2idx)
+        generator = Generator(input_dim, config.hidden_dim, input_dim, env).to(device)
+        discriminator = Discriminator(input_dim, config.hidden_dim, env).to(device)
+
+        # Train models
+        logging.info("Starting training...")
+        train_losses_g, train_losses_d, train_scores_d = train_gan(
+            generator,
+            discriminator,
+            dataloader,
+            dataloader_val,
+            config,
+            device
+        )
+
+        # Visualize training results
+        visualize_training(train_losses_g, train_losses_d, train_scores_d)
+
+        # Generate sample sequences
+        logging.info("Generating sample sequences...")
+        generator.eval()
+        discriminator.eval()
+        
+        num_samples = 10
+        generated_seqs = []
+        discriminator_scores = []
+
+        with torch.no_grad():
+            for _ in range(num_samples):
+                noise = torch.randint(0, input_dim, (1, 100)).to(device)
                 output = generator(noise)
-                _, topi = output.max(2)
-                token = topi.item()
-                if token == tokenizer.token2idx['<EOS>']:
-                    break
-                generated_seq.append(token)
-                noise = output
-        dna_seq = tokenizer.decode(generated_seq)
-        generated_seqs.append(''.join(dna_seq))
-        print(f"Generated DNA sequence {i+1}: {generated_seqs[-1]}")
+                seq_indices = torch.argmax(output, dim=-1)[0]
+                generated_seq = tokenizer.decode(seq_indices.cpu().tolist())
+                generated_seqs.append(generated_seq)
+                
+                # Calculate discriminator score
+                seq_tensor = torch.tensor([tokenizer.encode(generated_seq)]).to(device)
+                score = discriminator.score(seq_tensor).item()
+                discriminator_scores.append(score)
 
-    # Compute discriminator score for each generated sequence
-    discriminator_scores = []
-    for seq in generated_seqs:
-        encoded_seq = torch.tensor([tokenizer.encode(seq)]).to(device)
-        score = discriminator.score(encoded_seq).item()
-        discriminator_scores.append(score)
+        # Generate report
+        logging.info("\nGenerated DNA Sequences Report:")
+        logging.info("================================")
+        logging.info(f"\nDNA Purpose: {dna_purpose}")
+        logging.info("\nGenerated Sequences:")
+        
+        for i, (seq, score) in enumerate(zip(generated_seqs, discriminator_scores)):
+            logging.info(f"\nSequence {i+1}: {seq}")
+            logging.info(f"Discriminator Score: {score:.4f}")
+            
+            # Basic sequence analysis
+            gc_content = (seq.count('G') + seq.count('C')) / len(seq) * 100
+            logging.info(f"GC Content: {gc_content:.2f}%")
 
-    # Output report with generated sequences and discriminator scores
-    print("\nGenerated DNA Sequences Report:")
-    print("================================\n")
-    print(f"DNA Purpose: {dna_purpose}\n")
-    print("Generated Sequences:\n")
-    for i, seq in enumerate(generated_seqs):
-        print(f"Sequence {i+1}: {seq}")
-        print(f"Discriminator Score: {discriminator_scores[i]}\n")
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
-    # Load dataset
-    x_data, y_data, dna_purpose = load_dataset("train.csv", env)
-    x_data_val, y_data_val = load_validation_dataset("val.csv", env)
-
-    # Create DataLoaders
-    train_dataset = CustomDataset(x_data, y_data)
-    val_dataset = CustomDataset(x_data_val, y_data_val)
-    dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-    dataloader_val = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
-
-    # Instantiate the generator and discriminator
-    input_dim = len(DNATokenizer().token2idx)
-    hidden_dim = 128
-    output_dim = input_dim
-    generator = Generator(input_dim, hidden_dim, output_dim, env)
-    discriminator = Discriminator(input_dim, hidden_dim, env)
-
-    # Train the GAN
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    generator.to(device)
-    discriminator.to(device)
-    train_gan(generator, discriminator, dataloader, 100, device)
+    main()
