@@ -42,6 +42,42 @@ env = Environment(25.0, 7.0, 0.5, 0.0)
 
 - Evaluate the generated sequences using the Discriminator model.
 
+# Example output:
+```
+2025-02-06 14:23:15,632 - INFO - Using device: cuda
+2025-02-06 14:23:15,845 - INFO - Starting training...
+2025-02-06 14:23:18,234 - INFO - Epoch 1/100 | D loss: 1.8234 | G loss: 2.1456 | D score: 0.3245 | Val G loss: 1.9876 | Val D loss: 1.7654
+2025-02-06 14:23:20,567 - INFO - Epoch 2/100 | D loss: 1.6543 | G loss: 1.8765 | D score: 0.4123 | Val G loss: 1.7654 | Val D loss: 1.5432
+2025-02-06 14:23:22,890 - INFO - Epoch 3/100 | D loss: 1.4321 | G loss: 1.6543 | D score: 0.4876 | Val G loss: 1.5432 | Val D loss: 1.3210
+[...]
+2025-02-06 14:45:12,345 - INFO - Epoch 98/100 | D loss: 0.2345 | G loss: 0.3456 | D score: 0.8765 | Val G loss: 0.2123 | Val D loss: 0.1987
+2025-02-06 14:45:15,678 - INFO - Epoch 99/100 | D loss: 0.2123 | G loss: 0.3234 | D score: 0.8876 | Val G loss: 0.1987 | Val D loss: 0.1876
+2025-02-06 14:45:18,901 - INFO - Epoch 100/100 | D loss: 0.1987 | G loss: 0.3123 | D score: 0.8987 | Val G loss: 0.1876 | Val D loss: 0.1765
+
+2025-02-06 14:45:20,234 - INFO - Generating sample sequences...
+
+2025-02-06 14:45:20,567 - INFO - Generated DNA Sequences Report:
+2025-02-06 14:45:20,568 - INFO - ================================
+
+2025-02-06 14:45:20,569 - INFO - DNA Purpose: Promoter sequence for E. coli expression system
+
+2025-02-06 14:45:20,570 - INFO - Generated Sequences:
+
+2025-02-06 14:45:20,571 - INFO - Sequence 1: ATATAATGCCCGTTAGCGATCGAATCGCTAGCTAGCTGATCGATCGAT
+2025-02-06 14:45:20,572 - INFO - Discriminator Score: 0.8765
+2025-02-06 14:45:20,573 - INFO - GC Content: 48.32%
+
+2025-02-06 14:45:20,574 - INFO - Sequence 2: TTGACAGCTTATCATCGATAAGCTTTAATGCGGTAGTTTATCACAGTT
+2025-02-06 14:45:20,575 - INFO - Discriminator Score: 0.8543
+2025-02-06 14:45:20,576 - INFO - GC Content: 41.67%
+
+2025-02-06 14:45:20,577 - INFO - Sequence 3: GCTATCGATCGATCGATCGTAGCTAGCTAGCTGATCGATCGTAGCTAG
+2025-02-06 14:45:20,578 - INFO - Discriminator Score: 0.8932
+2025-02-06 14:45:20,579 - INFO - GC Content: 52.08%
+
+[... continues for all 10 sequences ...]
+```
+
 # Potential benefits:
 
 - Data-driven DNA sequence generation: GANs learn to generate DNA sequences from the training data, capturing the underlying distribution of the dataset. This enables the generation of biologically plausible DNA sequences that can survive in specific environments.
